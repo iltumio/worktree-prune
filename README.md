@@ -4,6 +4,26 @@
 
 CLI Rust per eliminare i worktree Git e i relativi target Cargo esterni, con una TUI per selezionarli. Porting dello script installato in `~/.local/bin/worktree-prune`, conservato in `legacy/worktree-prune.sh` come riferimento; il binario non lo esegue.
 
+## Installazione
+
+Richiede Rust/Cargo (verificato con Rust 1.95.0), Git e un linker C su Linux.
+
+```sh
+git clone https://github.com/iltumio/worktree-prune.git
+cd worktree-prune
+./install.sh
+```
+
+Lo script compila il checkout in modalità release con `Cargo.lock` e installa in `~/.local/bin`, senza `sudo`. Se trova un eseguibile diverso, ne conserva una copia `worktree-prune.bak.XXXXXX` prima di sostituirlo. Un errore di compilazione lascia intatta l'installazione precedente.
+
+Per scegliere un'altra directory:
+
+```sh
+INSTALL_DIR="$HOME/bin" ./install.sh
+```
+
+La directory scelta deve essere nel `PATH`; lo script segnala se manca, senza modificare la configurazione della shell. Supporta `CARGO_TARGET_DIR` per la cache di compilazione. Per aggiornare, esegui `git pull --ff-only` nel clone e rilancia `./install.sh`.
+
 ## Uso
 
 Esegui dal checkout principale del repository interessato, oppure usa `-C /percorso/repo`.
@@ -50,13 +70,6 @@ python3 tests/tui.py                    # test in pseudoterminale, dopo cargo bu
 ```
 
 I test usano esclusivamente repository temporanei. Coprono dry-run, cancellazione effettiva, branch, blocchi per dati locali, batch, target condivisi/esterni, symlink, residui, orfani, nomi ambigui, percorsi insoliti e ripristino del terminale.
-
-Per installare e conservare lo script precedente:
-
-```sh
-cp -p ~/.local/bin/worktree-prune ~/.local/bin/worktree-prune.sh.bak
-install -m 755 target/release/worktree-prune ~/.local/bin/worktree-prune
-```
 
 Implementazione: `src/main.rs` gestisce gli argomenti, `src/prune.rs` inventario/piano/rimozione, `src/tui.rs` l'interfaccia. La CLI usa [clap](https://docs.rs/clap/latest/clap/) e la TUI [Ratatui](https://docs.rs/ratatui/latest/ratatui/) con Crossterm.
 

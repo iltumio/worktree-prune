@@ -37,6 +37,13 @@ jobs:
         run: cargo build --release --locked
       - name: TUI tests in a pseudoterminal
         run: python3 tests/tui.py target/release/worktree-prune
+      - name: Verify installer
+        env:
+          INSTALL_DIR: ${{ runner.temp }}/worktree-prune-bin
+        run: |
+          sh -n install.sh
+          ./install.sh
+          "$INSTALL_DIR/worktree-prune" --version
       - name: Package binary
         run: tar -czf worktree-prune-linux-x86_64.tar.gz -C target/release worktree-prune -C ../.. LICENSE README.md
       - uses: actions/upload-artifact@v7
