@@ -83,7 +83,14 @@ def scenario(mode):
                     os.write(master, b'yq')
                 else:
                     os.write(master, b'q')
-            assert process.wait(timeout=10) == 0
+            # Keep draining redraws: a PTY can fill while the child is exiting,
+            # especially on CI runners with smaller terminal buffers.
+            deadline = time.monotonic() + 10
+            while process.poll() is None:
+                assert time.monotonic() < deadline, 'TUI did not exit'
+                if select.select([master], [], [], 0.1)[0]:
+                    captured.extend(os.read(master, 65536))
+            assert process.returncode == 0, captured.decode(errors='replace')
             assert wt.exists() == (mode not in ['apply', 'force_apply']), mode
             assert termios.tcgetattr(slave) == original, 'terminal was not restored'
         finally:
