@@ -2,7 +2,7 @@
 
 [![Build](https://github.com/iltumio/worktree-prune/actions/workflows/build.yml/badge.svg)](https://github.com/iltumio/worktree-prune/actions/workflows/build.yml)
 
-CLI Rust per eliminare i worktree Git e i relativi target Cargo esterni, con una TUI per selezionarli. Porting dello script originariamente installato in `~/.local/bin/worktree-prune`.
+CLI Rust per eliminare i worktree Git e i relativi target Cargo esterni, con una TUI per selezionarli.
 
 ## Installazione
 
