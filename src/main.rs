@@ -60,6 +60,7 @@ fn run(args: &Args, interactive: bool) -> Result<()> {
             let mut apply = interactive_args;
             apply.worktrees = selected.paths;
             apply.force = selected.force;
+            apply.sudo = selected.sudo;
             apply.stale = false;
             apply.orphans = false;
             let plan = repo.plan(&fresh, &apply)?;

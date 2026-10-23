@@ -32,10 +32,21 @@ def scenario(mode):
         git(root, 'worktree', 'add', '-b', 'feature', str(wt))
         if mode in ['blocked', 'force_apply', 'force_cancel', 'force_reset']:
             (wt / 'precious').write_text('keep me')
+        locked_dir = wt / 'locked_dir'
+        env = dict(os.environ, TERM='xterm-256color', CARGO_TARGET_BASE_DIR=str(Path(temp) / 'targets'))
+        if mode == 'sudo_apply':
+            locked_dir.mkdir()
+            (locked_dir / 'file').write_text('locked')
+            os.chmod(locked_dir, 0o500)
+            fake_bin = Path(temp) / 'bin'
+            fake_bin.mkdir()
+            sudo_shim = fake_bin / 'sudo'
+            sudo_shim.write_text('#!/bin/sh\nchmod -R u+rwx "$5" 2>/dev/null || true\nexec "$@"\n')
+            os.chmod(sudo_shim, 0o755)
+            env['PATH'] = f"{fake_bin}:{env.get('PATH', '')}"
         master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 32, 160, 0, 0))
         original = termios.tcgetattr(slave)
-        env = dict(os.environ, TERM='xterm-256color', CARGO_TARGET_BASE_DIR=str(Path(temp) / 'targets'))
         args = [str(BINARY)]
         process = subprocess.Popen(args, cwd=wt if mode == 'hard_block' else root, env=env, stdin=slave, stdout=slave, stderr=slave)
         captured = bytearray()
@@ -64,20 +75,20 @@ def scenario(mode):
                     assert wt.exists()
                     if mode == 'blocked':
                         os.write(master, b'nq')
-                    else:
+                    elif mode == 'force_apply':
                         os.write(master, b'y')
-                        wait_for(b'confirm')
-                        assert wt.exists(), 'enabling force must not delete immediately'
-                        if mode == 'force_apply':
-                            os.write(master, b'y')
-                        elif mode == 'force_cancel':
-                            os.write(master, b'q')
-                        else:
-                            os.write(master, b'\x1b')
-                            wait_for(b'preview')
-                            os.write(master, b'\r')
-                            wait_for(b'confirm FORCE')
-                            os.write(master, b'nq')
+                    elif mode == 'force_cancel':
+                        os.write(master, b'q')
+                    else:
+                        os.write(master, b'\x1b')
+                        wait_for(b'preview')
+                        os.write(master, b'\r')
+                        wait_for(b'confirm FORCE')
+                        os.write(master, b'nq')
+                elif mode == 'sudo_apply':
+                    wait_for(b'confirm FORCE + SUDO')
+                    assert wt.exists()
+                    os.write(master, b'y')
                 elif mode == 'hard_block':
                     wait_for(b'cannot force')
                     os.write(master, b'yq')
@@ -91,9 +102,11 @@ def scenario(mode):
                 if select.select([master], [], [], 0.1)[0]:
                     captured.extend(os.read(master, 65536))
             assert process.returncode == 0, captured.decode(errors='replace')
-            assert wt.exists() == (mode not in ['apply', 'force_apply']), mode
+            assert wt.exists() == (mode not in ['apply', 'force_apply', 'sudo_apply']), mode
             assert termios.tcgetattr(slave) == original, 'terminal was not restored'
         finally:
+            if locked_dir.exists():
+                os.chmod(locked_dir, 0o700)
             if process.poll() is None:
                 process.kill()
                 process.wait()
@@ -102,5 +115,5 @@ def scenario(mode):
     print(f'TUI {mode}: passed')
 
 
-for mode in ['preview', 'cancel', 'blocked', 'apply', 'force_apply', 'force_cancel', 'force_reset', 'hard_block']:
+for mode in ['preview', 'cancel', 'blocked', 'apply', 'force_apply', 'force_cancel', 'force_reset', 'sudo_apply', 'hard_block']:
     scenario(mode)

@@ -1,5 +1,6 @@
 use std::{
     fs,
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::{Command, Output},
 };
@@ -56,7 +57,8 @@ fn git(path: &Path, args: &[&str]) {
     let out = Command::new("git")
         .arg("-C")
         .arg(path)
-        .args(args)
+        .arg(args[0])
+        .args(&args[1..])
         .output()
         .unwrap();
     assert!(
@@ -247,4 +249,41 @@ fn ambiguous_basename_is_rejected() {
         );
     }
     assert!(!f.run(&["same", "--yes"]).status.success());
+}
+#[test]
+fn sudo_removes_unwritable_worktree_and_target() {
+    let f = Fixture::new();
+    let wt = f.wt("locked_perm");
+    let td = f.target("locked_perm");
+    let sub = wt.join("sub");
+    fs::create_dir(&sub).unwrap();
+    fs::write(sub.join("item"), "data").unwrap();
+    fs::set_permissions(&sub, fs::Permissions::from_mode(0o500)).unwrap();
+    assert!(!f.run(&["locked_perm", "--yes", "--force"]).status.success());
+    let bin = f._temp.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let sudo = bin.join("sudo");
+    fs::write(
+        &sudo,
+        "#!/bin/sh\nchmod -R u+rwx \"$5\" 2>/dev/null || true\nexec \"$@\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&sudo, fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_worktree-prune"))
+        .current_dir(&f.main)
+        .env("CARGO_TARGET_BASE_DIR", &f.base)
+        .env("PATH", path)
+        .args(["locked_perm", "--yes", "--force", "--sudo"])
+        .output()
+        .unwrap();
+    if sub.exists() {
+        let _ = fs::set_permissions(&sub, fs::Permissions::from_mode(0o700));
+    }
+    success(out);
+    assert!(!wt.exists() && !td.exists());
 }

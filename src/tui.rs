@@ -1,25 +1,44 @@
 use crate::{
     Args,
-    prune::{Entry, Kind, Repo, bytes, human},
+    prune::{Entry, Kind, Plan, Repo, bytes, human},
 };
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{
-    layout::{Constraint, Layout, Rect},
+    layout::{Constraint, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
+    symbols,
     text::{Line, Span},
-    widgets::{Block, BorderType, Cell, Clear, Padding, Paragraph, Row, Table, TableState, Wrap},
+    widgets::{
+        Block, BorderType, Cell, Clear, HighlightSpacing, LineGauge, List, ListItem, Padding,
+        Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, Table, TableState, Wrap,
+    },
 };
 use std::{collections::BTreeSet, path::PathBuf};
 
 pub struct Selection {
     pub paths: Vec<PathBuf>,
     pub force: bool,
+    pub sudo: bool,
+}
+
+enum ModalKind {
+    ConfirmPlan,
+    ConfirmForce { needs_force: bool, needs_sudo: bool },
+    HardBlocked,
+}
+
+struct Modal {
+    kind: ModalKind,
+    reasons: Vec<String>,
+    plan_lines: Vec<Line<'static>>,
+    freed_bytes: u64,
 }
 
 pub fn select(repo: &Repo, entries: &[Entry], args: &Args) -> Result<Option<Selection>> {
     eprintln!("Reading worktree status and target sizes…");
     let target_sizes: Vec<_> = entries.iter().map(|e| bytes(&e.target)).collect();
+    let total_target_bytes: u64 = target_sizes.iter().sum();
     let cells: Vec<_> = entries
         .iter()
         .enumerate()
@@ -59,63 +78,58 @@ pub fn select(repo: &Repo, entries: &[Entry], args: &Args) -> Result<Option<Sele
                 selected.insert(i);
             }
         }
-        let mut preview: Option<(String, bool)> = None;
-        let mut modal: Option<(String, bool)> = None;
-        let mut force = false;
+        let selectable_count = entries
+            .iter()
+            .filter(|e| e.kind != Kind::Main && !e.locked)
+            .count();
+        let mut modal: Option<Modal> = None;
         let mut scroll = 0u16;
         loop {
+            let selected_bytes: u64 = selected.iter().map(|&i| target_sizes[i]).sum();
             terminal.draw(|f| {
-                let areas = Layout::vertical([Constraint::Length(3), Constraint::Min(3), Constraint::Length(5), Constraint::Length(3)]).split(f.area());
-                f.render_widget(Paragraph::new(format!("worktree-prune  |  {}  |  {} selected{}", if args.yes { "APPLY" } else { "DRY RUN" }, selected.len(), if force { "  |  FORCE: local files may be lost" } else { "" })).block(Block::bordered()), areas[0]);
-                if let Some((text, _)) = &preview {
-                    f.render_widget(Paragraph::new(text.as_str()).wrap(Wrap { trim: false }).scroll((scroll, 0)).block(Block::bordered().title("Removal plan")), areas[1]);
-                } else {
-                    let rows = entries.iter().enumerate().map(|(i, e)| {
-                        let marker = if e.kind == Kind::Main || e.locked { "[-]" } else if selected.contains(&i) { "[x]" } else { "[ ]" };
-                        let data = &cells[i];
-                        Row::new(vec![
-                            Cell::from(marker),
-                            Cell::from(data[0].as_str()),
-                            Cell::from(data[1].as_str()),
-                            Cell::from(data[2].as_str()).style(Style::default().fg(state_color(&data[2]))),
-                            Cell::from(data[3].as_str()).style(Style::default().fg(match data[3].as_str() {
-                                "clean" => Color::Green, "dirty" => Color::Yellow, _ => Color::Red,
-                            })),
-                            Cell::from(Line::from(data[4].as_str()).right_aligned())
-                                .style(Style::default().fg(target_color(target_sizes[i]))),
-                        ]).style(if e.kind == Kind::Main || e.locked {
-                            Style::default().fg(Color::DarkGray)
-                        } else { Style::default() })
-                    });
-                    let table = Table::new(rows, [
-                        Constraint::Length(3),
-                        Constraint::Fill(2),
-                        Constraint::Fill(4),
-                        Constraint::Length(19),
-                        Constraint::Length(7),
-                        Constraint::Length(11),
-                    ])
-                    .header(Row::new(vec![
-                        Cell::from(""), Cell::from("WORKTREE"), Cell::from("BRANCH"),
-                        Cell::from("STATE"), Cell::from("CHANGES"),
-                        Cell::from(Line::from("TARGET").right_aligned()),
-                    ]).style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)).bottom_margin(1))
-                    .column_spacing(2)
-                    .block(Block::bordered().title("Worktrees"))
-                    .row_highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
-                    .highlight_symbol("› ");
-                    f.render_stateful_widget(table, areas[1], &mut cursor);
-                }
-                let detail = cursor.selected().and_then(|i| entries.get(i)).map(|e| format!("Path: {}\nTarget: {}\n{}", e.path.display(), e.target.display(), if args.keep_target { "Cargo target will be kept." } else { "Shared and protected targets will be kept." })).unwrap_or_else(|| "No worktrees found.".into());
-                f.render_widget(Paragraph::new(detail).wrap(Wrap { trim: false }).block(Block::bordered()), areas[2]);
-                let help = match &preview {
-                    Some((_, true)) => "y: confirm deletion  ·  Esc: back  ·  ↑↓: scroll  ·  q: cancel",
-                    Some(_) => "Esc: back  ·  ↑↓: scroll  ·  q: close (no deletion)",
-                    None => "↑↓ / j k: move  ·  Space: select  ·  a: toggle all  ·  Enter: preview  ·  q: quit",
-                };
-                f.render_widget(Paragraph::new(help).wrap(Wrap { trim: false }).block(Block::bordered()), areas[3]);
-                if let Some((message, can_force)) = &modal {
-                    render_force_modal(f, message, *can_force, selected.len(), scroll);
+                let areas = Layout::vertical([
+                    Constraint::Length(4),
+                    Constraint::Min(5),
+                    Constraint::Length(6),
+                    Constraint::Length(3),
+                ])
+                .split(f.area());
+
+                render_header(
+                    f,
+                    areas[0],
+                    args,
+                    selected.len(),
+                    selectable_count,
+                    selected_bytes,
+                    total_target_bytes,
+                );
+
+                render_worktree_table(
+                    f,
+                    areas[1],
+                    entries,
+                    &cells,
+                    &target_sizes,
+                    &selected,
+                    &mut cursor,
+                );
+
+                render_inspector(
+                    f,
+                    areas[2],
+                    entries,
+                    &target_sizes,
+                    &selected,
+                    selected_bytes,
+                    cursor.selected(),
+                    args,
+                );
+
+                render_footer(f, areas[3]);
+
+                if let Some(m) = &modal {
+                    render_modal(f, m, selected.len(), scroll);
                 }
             })?;
             let Event::Key(key) = event::read()? else {
@@ -129,7 +143,7 @@ pub fn select(repo: &Repo, entries: &[Entry], args: &Args) -> Result<Option<Sele
             {
                 return Ok(None);
             }
-            if let Some((_, can_force)) = &modal {
+            if let Some(m) = &modal {
                 match key.code {
                     KeyCode::Esc | KeyCode::Char('n') => {
                         modal = None;
@@ -137,42 +151,26 @@ pub fn select(repo: &Repo, entries: &[Entry], args: &Args) -> Result<Option<Sele
                     }
                     KeyCode::Down | KeyCode::Char('j') => scroll = scroll.saturating_add(1),
                     KeyCode::Up | KeyCode::Char('k') => scroll = scroll.saturating_sub(1),
-                    KeyCode::Char('y') if *can_force => {
-                        let mut check = args.clone();
-                        check.worktrees =
-                            selected.iter().map(|i| entries[*i].path.clone()).collect();
-                        check.stale = false;
-                        check.orphans = false;
-                        check.force = true;
-                        let plan = repo.plan(entries, &check)?;
-                        force = true;
-                        preview = Some((
-                            plan.describe()
-                                + "\n\nFORCE: local changes and untracked files will be discarded.\nPress y to permanently remove these items.",
-                            plan.errors.is_empty(),
-                        ));
-                        modal = None;
-                        scroll = 0;
-                    }
-                    _ => (),
-                }
-                continue;
-            }
-            if let Some((_, valid)) = &preview {
-                match key.code {
-                    KeyCode::Esc => {
-                        preview = None;
-                        force = false;
-                        scroll = 0;
-                    }
-                    KeyCode::Down | KeyCode::Char('j') => scroll = scroll.saturating_add(1),
-                    KeyCode::Up | KeyCode::Char('k') => scroll = scroll.saturating_sub(1),
-                    KeyCode::Char('y') if *valid => {
-                        return Ok(Some(Selection {
-                            paths: selected.iter().map(|i| entries[*i].path.clone()).collect(),
-                            force,
-                        }));
-                    }
+                    KeyCode::Char('y') => match m.kind {
+                        ModalKind::ConfirmPlan => {
+                            return Ok(Some(Selection {
+                                paths: selected.iter().map(|i| entries[*i].path.clone()).collect(),
+                                force: false,
+                                sudo: false,
+                            }));
+                        }
+                        ModalKind::ConfirmForce {
+                            needs_force,
+                            needs_sudo,
+                        } => {
+                            return Ok(Some(Selection {
+                                paths: selected.iter().map(|i| entries[*i].path.clone()).collect(),
+                                force: needs_force,
+                                sudo: needs_sudo,
+                            }));
+                        }
+                        ModalKind::HardBlocked => (),
+                    },
                     _ => (),
                 }
                 continue;
@@ -212,25 +210,67 @@ pub fn select(repo: &Repo, entries: &[Entry], args: &Args) -> Result<Option<Sele
                     check.worktrees = selected.iter().map(|i| entries[*i].path.clone()).collect();
                     check.stale = false;
                     check.orphans = false;
-                    let plan = repo.plan(entries, &check)?;
-                    let suffix = if !plan.errors.is_empty() {
-                        "\n\nBlocked: nothing will be removed."
+                    check.force = false;
+                    check.sudo = false;
+                    let base_plan = repo.plan(entries, &check)?;
+                    let freed_bytes = selected
+                        .iter()
+                        .filter(|&&i| {
+                            entries[i].kind == Kind::Orphan
+                                || (!args.keep_target && entries[i].target.is_dir())
+                        })
+                        .map(|&i| target_sizes[i])
+                        .sum();
+
+                    if base_plan.errors.is_empty() {
+                        modal = Some(Modal {
+                            kind: ModalKind::ConfirmPlan,
+                            reasons: Vec::new(),
+                            plan_lines: format_plan_lines(&base_plan),
+                            freed_bytes,
+                        });
                     } else {
-                        "\n\nPress y to permanently remove these items."
-                    };
-                    preview = Some((plan.describe() + suffix, plan.errors.is_empty()));
-                    if !plan.errors.is_empty() {
-                        check.force = true;
-                        let forced = repo.plan(entries, &check)?;
-                        let can_force = forced.errors.is_empty();
-                        let message = if can_force {
-                            plan.errors.join("\n\n")
+                        let mut force_args = check.clone();
+                        force_args.force = true;
+                        let force_plan = repo.plan(entries, &force_args)?;
+
+                        let mut sudo_args = check.clone();
+                        sudo_args.sudo = true;
+                        let sudo_plan = repo.plan(entries, &sudo_args)?;
+
+                        let mut both_args = check;
+                        both_args.force = true;
+                        both_args.sudo = true;
+                        let both_plan = repo.plan(entries, &both_args)?;
+
+                        if both_plan.errors.is_empty() {
+                            let needs_sudo = !force_plan.errors.is_empty();
+                            let needs_force = !sudo_plan.errors.is_empty() || needs_sudo;
+                            let mut reasons = base_plan.errors;
+                            for err in force_plan.errors {
+                                if !reasons.contains(&err) {
+                                    reasons.push(err);
+                                }
+                            }
+                            modal = Some(Modal {
+                                kind: ModalKind::ConfirmForce {
+                                    needs_force,
+                                    needs_sudo,
+                                },
+                                reasons,
+                                plan_lines: format_plan_lines(&both_plan),
+                                freed_bytes,
+                            });
                         } else {
-                            forced.errors.join("\n\n")
-                        };
-                        modal = Some((message, can_force));
-                        scroll = 0;
+                            modal = Some(Modal {
+                                kind: ModalKind::HardBlocked,
+                                reasons: both_plan.errors.clone(),
+                                plan_lines: format_plan_lines(&both_plan),
+                                freed_bytes: 0,
+                            });
+                        }
                     }
+                    scroll = 0;
                 }
                 _ => (),
             }
@@ -238,6 +278,473 @@ pub fn select(repo: &Repo, entries: &[Entry], args: &Args) -> Result<Option<Sele
     })();
     ratatui::restore();
     result
+}
+
+fn render_header(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    args: &Args,
+    selected_count: usize,
+    selectable_count: usize,
+    selected_bytes: u64,
+    total_bytes: u64,
+) {
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Rgb(75, 95, 130)))
+        .padding(Padding::horizontal(1));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let rows = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(inner);
+
+    let mut badges = vec![
+        Span::styled(
+            " worktree-prune ",
+            Style::default()
+                .fg(Color::Rgb(16, 20, 28))
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            if args.yes { " APPLY " } else { " DRY RUN " },
+            Style::default()
+                .fg(Color::Rgb(16, 20, 28))
+                .bg(if args.yes {
+                    Color::Rgb(105, 210, 145)
+                } else {
+                    Color::Yellow
+                })
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            format!("{selected_count}/{selectable_count} selected"),
+            Style::default()
+                .fg(if selected_count > 0 {
+                    Color::White
+                } else {
+                    Color::DarkGray
+                })
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  │  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!(
+                "Reclaim: {} / {}",
+                human(selected_bytes),
+                human(total_bytes)
+            ),
+            Style::default().fg(if selected_bytes > 0 {
+                Color::Cyan
+            } else {
+                Color::Gray
+            }),
+        ),
+    ];
+    if args.keep_target {
+        badges.push(Span::styled("  │  ", Style::default().fg(Color::DarkGray)));
+        badges.push(Span::styled(
+            "KEEP TARGET",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    if args.delete_branch {
+        badges.push(Span::styled("  │  ", Style::default().fg(Color::DarkGray)));
+        badges.push(Span::styled(
+            "DELETE BRANCH",
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(badges)), rows[0]);
+
+    if rows[1].height > 0 {
+        let ratio = if total_bytes > 0 {
+            (selected_bytes as f64 / total_bytes as f64).clamp(0.0, 1.0)
+        } else if selectable_count > 0 {
+            (selected_count as f64 / selectable_count as f64).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let gauge = LineGauge::default()
+            .ratio(ratio)
+            .label(Span::styled(
+                format!("{:>3.0}% ", ratio * 100.0),
+                Style::default().fg(Color::Gray),
+            ))
+            .filled_style(
+                Style::default()
+                    .fg(if selected_count > 0 {
+                        Color::Cyan
+                    } else {
+                        Color::DarkGray
+                    })
+                    .add_modifier(Modifier::BOLD),
+            )
+            .unfilled_style(Style::default().fg(Color::Rgb(50, 58, 75)))
+            .filled_symbol(symbols::line::THICK_HORIZONTAL)
+            .unfilled_symbol(symbols::line::HORIZONTAL);
+        frame.render_widget(gauge, rows[1]);
+    }
+}
+
+fn render_worktree_table(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    entries: &[Entry],
+    cells: &[[String; 5]],
+    target_sizes: &[u64],
+    selected: &BTreeSet<usize>,
+    cursor: &mut TableState,
+) {
+    let rows = entries.iter().enumerate().map(|(i, e)| {
+        let protected = e.kind == Kind::Main || e.locked;
+        let is_selected = selected.contains(&i);
+        let marker = if protected {
+            Cell::from(Span::styled("[-]", Style::default().fg(Color::DarkGray)))
+        } else if is_selected {
+            Cell::from(Span::styled(
+                "[x]",
+                Style::default()
+                    .fg(Color::Rgb(105, 210, 145))
+                    .add_modifier(Modifier::BOLD),
+            ))
+        } else {
+            Cell::from(Span::styled("[ ]", Style::default().fg(Color::Gray)))
+        };
+        let data = &cells[i];
+        let name_style = if protected {
+            Style::default().fg(Color::DarkGray)
+        } else if is_selected {
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        Row::new(vec![
+            marker,
+            Cell::from(data[0].as_str()).style(name_style),
+            Cell::from(data[1].as_str()).style(if data[1] == "detached" {
+                Style::default().fg(Color::DarkGray)
+            } else {
+                Style::default()
+            }),
+            Cell::from(data[2].as_str()).style(
+                Style::default()
+                    .fg(state_color(&data[2]))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Cell::from(data[3].as_str()).style(Style::default().fg(match data[3].as_str() {
+                "clean" => Color::Green,
+                "dirty" => Color::Yellow,
+                _ => Color::Red,
+            })),
+            Cell::from(Line::from(data[4].as_str()).right_aligned())
+                .style(Style::default().fg(target_color(target_sizes[i]))),
+        ])
+        .style(if protected {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default()
+        })
+    });
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(4),
+            Constraint::Fill(2),
+            Constraint::Fill(3),
+            Constraint::Length(18),
+            Constraint::Length(9),
+            Constraint::Length(12),
+        ],
+    )
+    .header(
+        Row::new(vec![
+            Cell::from(""),
+            Cell::from("WORKTREE"),
+            Cell::from("BRANCH"),
+            Cell::from("STATE"),
+            Cell::from("CHANGES"),
+            Cell::from(Line::from("TARGET").right_aligned()),
+        ])
+        .style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .bottom_margin(1),
+    )
+    .column_spacing(2)
+    .block(
+        Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::Rgb(75, 95, 130)))
+            .title(Span::styled(
+                format!(" Worktrees ({}) ", entries.len()),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .padding(Padding::horizontal(1)),
+    )
+    .row_highlight_style(
+        Style::default()
+            .bg(Color::Rgb(42, 50, 68))
+            .add_modifier(Modifier::BOLD),
+    )
+    .highlight_symbol("› ")
+    .highlight_spacing(HighlightSpacing::Always);
+
+    frame.render_stateful_widget(table, area, cursor);
+
+    if entries.len() > 1 {
+        let mut scrollbar_state =
+            ScrollbarState::new(entries.len()).position(cursor.selected().unwrap_or(0));
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None)
+            .track_symbol(Some("│"))
+            .thumb_symbol("┃")
+            .style(Style::default().fg(Color::Rgb(90, 110, 145)));
+        frame.render_stateful_widget(
+            scrollbar,
+            area.inner(Margin {
+                vertical: 1,
+                horizontal: 0,
+            }),
+            &mut scrollbar_state,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_inspector(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    entries: &[Entry],
+    target_sizes: &[u64],
+    selected: &BTreeSet<usize>,
+    selected_bytes: u64,
+    current_idx: Option<usize>,
+    args: &Args,
+) {
+    let cols =
+        Layout::horizontal([Constraint::Percentage(64), Constraint::Percentage(36)]).split(area);
+
+    let detail_block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Rgb(65, 80, 110)))
+        .title(Span::styled(
+            " Inspector ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .padding(Padding::horizontal(1));
+
+    if let Some(i) = current_idx
+        && let Some(e) = entries.get(i)
+    {
+        let status_note = if e.kind == Kind::Main {
+            Span::styled(
+                "Main checkout (protected)",
+                Style::default().fg(Color::Cyan),
+            )
+        } else if e.locked {
+            Span::styled(
+                "Locked worktree (unlock explicitly to remove)",
+                Style::default().fg(Color::Yellow),
+            )
+        } else if args.keep_target {
+            Span::styled(
+                "Cargo target will be kept (--keep-target)",
+                Style::default().fg(Color::Yellow),
+            )
+        } else {
+            Span::styled(
+                format!(
+                    "Kind: {:?}  •  Target size: {} (unshared targets removed)",
+                    e.kind,
+                    human(target_sizes[i])
+                ),
+                Style::default().fg(Color::Gray),
+            )
+        };
+        let detail_table = Table::new(
+            vec![
+                Row::new(vec![
+                    Cell::from(Span::styled(
+                        "Path",
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::BOLD),
+                    )),
+                    Cell::from(e.path.display().to_string()),
+                ]),
+                Row::new(vec![
+                    Cell::from(Span::styled(
+                        "Target",
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::BOLD),
+                    )),
+                    Cell::from(e.target.display().to_string()),
+                ]),
+                Row::new(vec![
+                    Cell::from(Span::styled(
+                        "Policy",
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::BOLD),
+                    )),
+                    Cell::from(Line::from(status_note)),
+                ]),
+            ],
+            [Constraint::Length(8), Constraint::Fill(1)],
+        )
+        .column_spacing(1)
+        .block(detail_block);
+        frame.render_widget(detail_table, cols[0]);
+    } else {
+        frame.render_widget(
+            Paragraph::new("No worktrees found.").block(detail_block),
+            cols[0],
+        );
+    }
+
+    let summary_block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Rgb(65, 80, 110)))
+        .title(Span::styled(
+            " Batch Summary ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .padding(Padding::horizontal(1));
+
+    let items = vec![
+        ListItem::new(Line::from(vec![
+            Span::styled("Selected: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{} item(s)", selected.len()),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+        ])),
+        ListItem::new(Line::from(vec![
+            Span::styled("To free:  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                human(selected_bytes),
+                Style::default()
+                    .fg(target_color(selected_bytes))
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ])),
+        ListItem::new(Line::from(vec![
+            Span::styled("Confirm:  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                "Single modal confirmation",
+                Style::default().fg(Color::Gray),
+            ),
+        ])),
+    ];
+    frame.render_widget(List::new(items).block(summary_block), cols[1]);
+}
+
+fn render_footer(frame: &mut ratatui::Frame, area: Rect) {
+    let key_style = Style::default()
+        .fg(Color::Rgb(16, 20, 28))
+        .bg(Color::Rgb(130, 150, 185))
+        .add_modifier(Modifier::BOLD);
+    let desc_style = Style::default().fg(Color::Gray);
+    let sep = Span::styled("   ", Style::default());
+
+    let line = Line::from(vec![
+        Span::styled(" ↑↓ / j k ", key_style),
+        Span::styled(" move", desc_style),
+        sep.clone(),
+        Span::styled(" Space ", key_style),
+        Span::styled(" select", desc_style),
+        sep.clone(),
+        Span::styled(" a ", key_style),
+        Span::styled(" toggle all", desc_style),
+        sep.clone(),
+        Span::styled(" Enter ", key_style),
+        Span::styled(" preview & confirm", desc_style),
+        sep,
+        Span::styled(" q ", key_style),
+        Span::styled(" quit", desc_style),
+    ]);
+
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Rgb(65, 80, 110)))
+        .padding(Padding::horizontal(1));
+    frame.render_widget(Paragraph::new(line).block(block), area);
+}
+
+fn format_plan_lines(plan: &Plan) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    for note in &plan.notes {
+        lines.push(Line::from(vec![
+            Span::styled(
+                "NOTE ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(note.clone()),
+        ]));
+    }
+    for item in &plan.items {
+        lines.push(Line::from(vec![
+            Span::styled(
+                "REMOVE ",
+                Style::default()
+                    .fg(Color::Rgb(245, 119, 128))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{:?}: ", item.entry.kind),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(item.entry.path.display().to_string()),
+        ]));
+        if item.target {
+            lines.push(Line::from(vec![
+                Span::styled("  └─ cargo target: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    item.entry.target.display().to_string(),
+                    Style::default().fg(Color::Gray),
+                ),
+            ]));
+        }
+    }
+    for err in &plan.errors {
+        lines.push(Line::from(vec![
+            Span::styled(
+                "BLOCKED: ",
+                Style::default()
+                    .fg(Color::Rgb(245, 119, 128))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(err.clone()),
+        ]));
+    }
+    if lines.is_empty() {
+        lines.push(Line::from("Nothing to do."));
+    }
+    lines
 }
 
 fn state_color(state: &str) -> Color {
@@ -264,31 +771,59 @@ fn target_color(bytes: u64) -> Color {
     }
 }
 
-fn render_force_modal(
-    frame: &mut ratatui::Frame,
-    message: &str,
-    can_force: bool,
-    selected: usize,
-    scroll: u16,
-) {
+fn render_modal(frame: &mut ratatui::Frame, modal: &Modal, selected: usize, scroll: u16) {
     let screen = frame.area();
     let background = Color::Rgb(24, 28, 39);
     let panel = Color::Rgb(32, 38, 51);
     let foreground = Color::Rgb(230, 234, 242);
     let muted = Color::Rgb(154, 165, 184);
-    let accent = if can_force {
-        Color::Rgb(245, 190, 85)
-    } else {
-        Color::Rgb(245, 119, 128)
+
+    let (accent, title, subtitle) = match modal.kind {
+        ModalKind::ConfirmPlan => (
+            Color::Rgb(105, 210, 145),
+            "Removal plan — confirm deletion",
+            format!(
+                "{selected} selected  •  {} target data to free",
+                human(modal.freed_bytes)
+            ),
+        ),
+        ModalKind::ConfirmForce {
+            needs_force: _,
+            needs_sudo: true,
+        } => (
+            Color::Rgb(245, 155, 75),
+            "Blocked — confirm FORCE + SUDO",
+            format!(
+                "{selected} selected  •  {} to free  •  sudo required for locked folders",
+                human(modal.freed_bytes)
+            ),
+        ),
+        ModalKind::ConfirmForce {
+            needs_force: _,
+            needs_sudo: false,
+        } => (
+            Color::Rgb(245, 190, 85),
+            "Blocked — confirm FORCE",
+            format!(
+                "{selected} selected  •  {} to free  •  Nothing has been removed yet",
+                human(modal.freed_bytes)
+            ),
+        ),
+        ModalKind::HardBlocked => (
+            Color::Rgb(245, 119, 128),
+            "Blocked — cannot force",
+            format!("{selected} selected  •  Nothing has been removed"),
+        ),
     };
+
     frame.buffer_mut().set_style(
         screen,
         Style::default()
             .fg(Color::Rgb(83, 91, 108))
             .bg(Color::Rgb(15, 18, 26)),
     );
-    let width = screen.width.saturating_sub(4).min(96);
-    let height = screen.height.saturating_sub(2).min(28);
+    let width = screen.width.saturating_sub(4).min(100);
+    let height = screen.height.saturating_sub(2).min(30);
     let area = Rect::new(
         screen.x + (screen.width - width) / 2,
         screen.y + (screen.height - height) / 2,
@@ -304,66 +839,147 @@ fn render_force_modal(
     frame.render_widget(Clear, area);
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
+        .title(" Removal plan ")
         .border_style(Style::default().fg(accent))
         .style(Style::default().bg(background).fg(foreground))
         .padding(Padding::horizontal(if width >= 60 { 2 } else { 1 }));
     let inner = block.inner(area);
     frame.render_widget(block, area);
+
     let compact = inner.height < 20;
     let parts = Layout::vertical([
         Constraint::Length(if compact { 2 } else { 3 }),
-        Constraint::Min(2),
-        Constraint::Length(if compact { 4 } else { 5 }),
+        Constraint::Min(4),
+        Constraint::Length(if compact { 3 } else { 4 }),
         Constraint::Length(3),
         Constraint::Length(1),
     ])
     .split(inner);
-    let title = if can_force {
-        "Blocked — confirm FORCE"
-    } else {
-        "Blocked — cannot force"
-    };
+
+    let mut header_spans = vec![Span::styled(
+        format!("!  {title}"),
+        Style::default().fg(accent).add_modifier(Modifier::BOLD),
+    )];
+    if let ModalKind::ConfirmForce {
+        needs_force,
+        needs_sudo,
+    } = modal.kind
+    {
+        if needs_force {
+            header_spans.push(Span::raw("  "));
+            header_spans.push(Span::styled(
+                " FORCE ",
+                Style::default()
+                    .fg(background)
+                    .bg(Color::Rgb(245, 190, 85))
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        if needs_sudo {
+            header_spans.push(Span::raw(" "));
+            header_spans.push(Span::styled(
+                " SUDO ",
+                Style::default()
+                    .fg(background)
+                    .bg(Color::Rgb(245, 119, 128))
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+    }
+
     frame.render_widget(
         Paragraph::new(vec![
-            Line::from(Span::styled(
-                format!("!  {title}"),
-                Style::default().fg(accent).add_modifier(Modifier::BOLD),
-            )),
-            Line::from(Span::styled(
-                format!("{selected} selected  /  Nothing has been removed"),
-                Style::default().fg(muted),
-            )),
+            Line::from(header_spans),
+            Line::from(Span::styled(subtitle, Style::default().fg(muted))),
         ]),
         parts[0],
     );
+
+    let mut body_lines: Vec<Line<'static>> = Vec::new();
+    if !modal.reasons.is_empty() {
+        body_lines.push(Line::from(Span::styled(
+            "Reasons for blocking:",
+            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+        )));
+        for r in &modal.reasons {
+            body_lines.push(Line::from(vec![
+                Span::styled("  • ", Style::default().fg(accent)),
+                Span::raw(r.clone()),
+            ]));
+        }
+        body_lines.push(Line::from(""));
+    }
+    if !modal.plan_lines.is_empty() {
+        body_lines.push(Line::from(Span::styled(
+            "Plan details:",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )));
+        body_lines.extend(modal.plan_lines.iter().cloned());
+    }
+
+    let total_lines = body_lines.len();
     frame.render_widget(
-        Paragraph::new(message)
+        Paragraph::new(body_lines)
             .wrap(Wrap { trim: false })
             .scroll((scroll, 0))
             .block(
                 Block::bordered()
                     .border_type(BorderType::Rounded)
-                    .title(" Reasons for blocking ")
+                    .title(" Checks & items ")
                     .border_style(Style::default().fg(Color::Rgb(67, 78, 98)))
                     .style(Style::default().bg(panel).fg(foreground))
                     .padding(Padding::horizontal(1)),
             ),
         parts[1],
     );
-    let warning = if can_force {
-        "Local changes and untracked files will be lost. Local-only commits may remain only in the local branch. You will review the forced plan before deletion."
-    } else {
-        "Force cannot bypass these protections. Resolve the reasons above, then try again."
+
+    if total_lines > parts[1].height.saturating_sub(2) as usize {
+        let mut sb_state = ScrollbarState::new(total_lines).position(scroll as usize);
+        let sb = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None)
+            .style(Style::default().fg(accent));
+        frame.render_stateful_widget(
+            sb,
+            parts[1].inner(Margin {
+                vertical: 1,
+                horizontal: 0,
+            }),
+            &mut sb_state,
+        );
+    }
+
+    let (callout_title, warning) = match modal.kind {
+        ModalKind::ConfirmPlan => (
+            "Ready to remove",
+            "Selected worktrees and their unshared Cargo targets will be permanently deleted.",
+        ),
+        ModalKind::ConfirmForce {
+            needs_force: _,
+            needs_sudo: true,
+        } => (
+            "Before you continue (FORCE + SUDO)",
+            "Locked/unwritable or foreign-owned folders will be removed with sudo (password may be requested). Local changes and untracked files will be lost.",
+        ),
+        ModalKind::ConfirmForce {
+            needs_force: _,
+            needs_sudo: false,
+        } => (
+            "Before you continue (FORCE)",
+            "Local changes and untracked files will be lost. Local-only commits remain only in the local branch.",
+        ),
+        ModalKind::HardBlocked => (
+            "This selection is protected",
+            "Force and sudo cannot bypass these protections. Resolve the reasons above, then try again.",
+        ),
     };
+
     frame.render_widget(
         Paragraph::new(vec![
-            Line::from(""),
             Line::from(Span::styled(
-                if can_force {
-                    "Before you continue"
-                } else {
-                    "This selection is protected"
-                },
+                callout_title,
                 Style::default().fg(accent).add_modifier(Modifier::BOLD),
             )),
             Line::from(warning),
@@ -371,6 +987,7 @@ fn render_force_modal(
         .wrap(Wrap { trim: false }),
         parts[2],
     );
+
     let mut buttons = vec![Span::styled(
         "  n / Esc  Cancel  ",
         Style::default()
@@ -378,22 +995,52 @@ fn render_force_modal(
             .bg(Color::Rgb(57, 66, 83))
             .add_modifier(Modifier::BOLD),
     )];
-    if can_force {
-        buttons.push(Span::raw("   "));
-        buttons.push(Span::styled(
-            "  y  Enable force  ",
-            Style::default()
-                .fg(background)
-                .bg(accent)
-                .add_modifier(Modifier::BOLD),
-        ));
+    match modal.kind {
+        ModalKind::ConfirmPlan => {
+            buttons.push(Span::raw("   "));
+            buttons.push(Span::styled(
+                "  y  Confirm removal  ",
+                Style::default()
+                    .fg(background)
+                    .bg(accent)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        ModalKind::ConfirmForce {
+            needs_force: _,
+            needs_sudo: true,
+        } => {
+            buttons.push(Span::raw("   "));
+            buttons.push(Span::styled(
+                "  y  Confirm force + sudo  ",
+                Style::default()
+                    .fg(background)
+                    .bg(accent)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        ModalKind::ConfirmForce {
+            needs_force: _,
+            needs_sudo: false,
+        } => {
+            buttons.push(Span::raw("   "));
+            buttons.push(Span::styled(
+                "  y  Confirm force removal  ",
+                Style::default()
+                    .fg(background)
+                    .bg(accent)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        ModalKind::HardBlocked => (),
     }
     frame.render_widget(
         Paragraph::new(vec![Line::from(""), Line::from(buttons).right_aligned()]),
         parts[3],
     );
     frame.render_widget(
-        Paragraph::new("↑ / ↓  Scroll reasons").style(Style::default().fg(muted)),
+        Paragraph::new("↑/↓ Scroll  •  y Confirm  •  n/Esc Back  •  q Quit")
+            .style(Style::default().fg(muted)),
         parts[4],
     );
 }

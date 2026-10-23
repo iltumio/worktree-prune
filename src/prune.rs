@@ -42,13 +42,13 @@ pub struct Repo {
     key: PathBuf,
 }
 pub struct Item {
-    entry: Entry,
-    target: bool,
+    pub entry: Entry,
+    pub target: bool,
 }
 pub struct Plan {
     pub items: Vec<Item>,
     pub errors: Vec<String>,
-    notes: Vec<String>,
+    pub notes: Vec<String>,
 }
 impl Plan {
     pub fn describe(&self) -> String {
@@ -449,12 +449,12 @@ impl Repo {
                             e.path.is_dir(),
                             "missing worktree; use git worktree prune to clear its registration"
                         );
-                        let dirty = self.dirty(e)?;
+                        let dirty = self.dirty(e).unwrap_or(true);
                         ensure!(
                             !dirty || args.force,
                             "uncommitted or untracked files; pass --force to discard"
                         );
-                        let state = self.state(e)?;
+                        let state = self.state(e).unwrap_or_else(|_| "unknown".into());
                         ensure!(
                             args.force || state == "merged" || state == "pushed",
                             "commits are local-only; push them or pass --force"
@@ -538,9 +538,21 @@ impl Repo {
                     let result = output(git.arg("--").arg(&e.path));
                     if let Err(err) = result {
                         if self.registered()?.iter().any(|wt| wt.path == e.path) {
-                            return Err(err).context("Git refused removal; target kept");
+                            if args.sudo && preflight(&e.path, false).is_err() {
+                                remove(&e.path, true)?;
+                                let mut retry = self.git();
+                                retry.args(["worktree", "remove"]);
+                                if args.force {
+                                    retry.arg("--force");
+                                }
+                                output(retry.arg("--").arg(&e.path))
+                                    .context("Git refused removal; target kept")?;
+                            } else {
+                                return Err(err).context("Git refused removal; target kept");
+                            }
+                        } else {
+                            remove(&e.path, args.sudo)?;
                         }
-                        remove(&e.path, args.sudo)?;
                     }
                 }
                 Kind::Stale => remove(&e.path, args.sudo)?,
@@ -599,6 +611,17 @@ fn preflight(path: &Path, sudo: bool) -> Result<()> {
     // Conservative ownership check before Git can partially remove a checkout.
     let uid = unsafe { libc::geteuid() };
     let device = fs::symlink_metadata(path)?.dev();
+    if !sudo
+        && let Some(parent) = path.parent()
+        && parent.exists()
+    {
+        let c = std::ffi::CString::new(parent.as_os_str().as_bytes())?;
+        ensure!(
+            unsafe { libc::access(c.as_ptr(), libc::W_OK | libc::X_OK) } == 0,
+            "unwritable directory {}; pass --sudo",
+            parent.display()
+        );
+    }
     for entry in WalkDir::new(path)
         .follow_links(false)
         .same_file_system(true)
@@ -606,7 +629,10 @@ fn preflight(path: &Path, sudo: bool) -> Result<()> {
         let entry = match entry {
             Ok(e) => e,
             Err(_) if sudo => continue,
-            Err(e) => return Err(e.into()),
+            Err(e) => {
+                let p = e.path().unwrap_or(path);
+                bail!("unreadable directory {}; pass --sudo ({e})", p.display());
+            }
         };
         let meta = fs::symlink_metadata(entry.path())?;
         ensure!(
@@ -623,7 +649,7 @@ fn preflight(path: &Path, sudo: bool) -> Result<()> {
             if meta.is_dir() {
                 let c = std::ffi::CString::new(entry.path().as_os_str().as_bytes())?;
                 ensure!(
-                    unsafe { libc::access(c.as_ptr(), libc::W_OK | libc::X_OK) } == 0,
+                    unsafe { libc::access(c.as_ptr(), libc::R_OK | libc::W_OK | libc::X_OK) } == 0,
                     "unwritable directory {}; pass --sudo",
                     entry.path().display()
                 );
@@ -633,16 +659,17 @@ fn preflight(path: &Path, sudo: bool) -> Result<()> {
     Ok(())
 }
 fn remove(path: &Path, sudo: bool) -> Result<()> {
-    if !path.exists() {
+    if fs::symlink_metadata(path).is_err() {
         return Ok(());
     }
     preflight(path, sudo)?;
     if sudo && preflight(path, false).is_err() {
-        output(
-            Command::new("sudo")
-                .args(["rm", "-rf", "--one-file-system", "--"])
-                .arg(path),
-        )?;
+        let status = Command::new("sudo")
+            .args(["rm", "-rf", "--one-file-system", "--"])
+            .arg(path)
+            .status()
+            .context("cannot run sudo")?;
+        ensure!(status.success(), "sudo rm failed for {}", path.display());
     } else {
         fs::remove_dir_all(path).with_context(|| format!("cannot remove {}", path.display()))?;
     }
