@@ -1,3 +1,4 @@
+mod config;
 mod prune;
 mod tui;
 
@@ -8,6 +9,9 @@ use std::{io::IsTerminal, path::PathBuf};
 #[derive(Parser, Debug, Clone)]
 #[command(version, about)]
 pub struct Args {
+    /// TUI-only operation: preserve worktrees and clean their displayed targets.
+    #[arg(skip)]
+    clean_only: bool,
     /// Worktree names or paths (no arguments opens the TUI)
     worktrees: Vec<PathBuf>,
     /// Preview without removing anything (default)
@@ -40,13 +44,14 @@ pub struct Args {
     /// Select unclaimed Cargo target directories
     #[arg(long)]
     orphans: bool,
-    /// Run in this repository
+    /// Recursively search this directory for Git repositories
     #[arg(short = 'C', long, default_value = ".")]
     repo: PathBuf,
 }
 
 fn run(args: &Args, interactive: bool) -> Result<()> {
-    let repo = prune::Repo::open(&args.repo)?;
+    config::init()?;
+    let repo = prune::Workspace::discover(&args.repo)?;
     let entries = repo.inventory(args.orphans)?;
     if interactive {
         if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
@@ -59,11 +64,20 @@ fn run(args: &Args, interactive: bool) -> Result<()> {
             let fresh = repo.inventory(args.orphans)?;
             let mut apply = interactive_args;
             apply.worktrees = selected.paths;
+            apply.clean_only = selected.clean_only;
             apply.force = selected.force;
             apply.sudo = selected.sudo;
             apply.stale = false;
             apply.orphans = false;
             let plan = repo.plan(&fresh, &apply)?;
+            if apply.clean_only
+                && plan
+                    .items
+                    .iter()
+                    .any(|item| !selected.targets.contains(&item.entry.target))
+            {
+                bail!("target paths changed after confirmation; review a new plan");
+            }
             repo.execute(&plan, &apply)?;
         }
         return Ok(());

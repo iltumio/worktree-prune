@@ -1,6 +1,6 @@
 use crate::{
     Args,
-    prune::{Entry, Kind, Plan, Repo, bytes, human},
+    prune::{Entry, Kind, Plan, Workspace, bytes, human},
 };
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -14,10 +14,13 @@ use ratatui::{
         Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, Table, TableState, Wrap,
     },
 };
+use rayon::prelude::*;
 use std::{collections::BTreeSet, path::PathBuf};
 
 pub struct Selection {
     pub paths: Vec<PathBuf>,
+    pub targets: Vec<PathBuf>,
+    pub clean_only: bool,
     pub force: bool,
     pub sudo: bool,
 }
@@ -29,22 +32,25 @@ enum ModalKind {
 }
 
 struct Modal {
+    clean_only: bool,
     kind: ModalKind,
     reasons: Vec<String>,
     plan_lines: Vec<Line<'static>>,
     freed_bytes: u64,
 }
 
-pub fn select(repo: &Repo, entries: &[Entry], args: &Args) -> Result<Option<Selection>> {
+pub fn select(repo: &Workspace, entries: &[Entry], args: &Args) -> Result<Option<Selection>> {
+    let mut mode_args = args.clone();
+    let args = &mut mode_args;
     eprintln!("Reading worktree status and target sizes…");
-    let target_sizes: Vec<_> = entries.iter().map(|e| bytes(&e.target)).collect();
+    let target_sizes: Vec<_> = entries.par_iter().map(|e| bytes(&e.target)).collect();
     let total_target_bytes: u64 = target_sizes.iter().sum();
     let cells: Vec<_> = entries
-        .iter()
+        .par_iter()
         .enumerate()
         .map(|(i, e)| {
             [
-                e.name().escape_default().to_string(),
+                repo.label(e).escape_default().to_string(),
                 e.branch.as_deref().unwrap_or("detached").to_owned(),
                 format!(
                     "{}{}",
@@ -78,13 +84,13 @@ pub fn select(repo: &Repo, entries: &[Entry], args: &Args) -> Result<Option<Sele
                 selected.insert(i);
             }
         }
-        let selectable_count = entries
-            .iter()
-            .filter(|e| e.kind != Kind::Main && !e.locked)
-            .count();
         let mut modal: Option<Modal> = None;
         let mut scroll = 0u16;
         loop {
+            let selectable_count = entries
+                .iter()
+                .filter(|e| selectable(e, args.clean_only))
+                .count();
             let selected_bytes: u64 = selected.iter().map(|&i| target_sizes[i]).sum();
             terminal.draw(|f| {
                 let areas = Layout::vertical([
@@ -113,6 +119,7 @@ pub fn select(repo: &Repo, entries: &[Entry], args: &Args) -> Result<Option<Sele
                     &target_sizes,
                     &selected,
                     &mut cursor,
+                    args.clean_only,
                 );
 
                 render_inspector(
@@ -155,6 +162,11 @@ pub fn select(repo: &Repo, entries: &[Entry], args: &Args) -> Result<Option<Sele
                         ModalKind::ConfirmPlan => {
                             return Ok(Some(Selection {
                                 paths: selected.iter().map(|i| entries[*i].path.clone()).collect(),
+                                targets: selected
+                                    .iter()
+                                    .map(|i| entries[*i].target.clone())
+                                    .collect(),
+                                clean_only: m.clean_only,
                                 force: false,
                                 sudo: false,
                             }));
@@ -165,6 +177,11 @@ pub fn select(repo: &Repo, entries: &[Entry], args: &Args) -> Result<Option<Sele
                         } => {
                             return Ok(Some(Selection {
                                 paths: selected.iter().map(|i| entries[*i].path.clone()).collect(),
+                                targets: selected
+                                    .iter()
+                                    .map(|i| entries[*i].target.clone())
+                                    .collect(),
+                                clean_only: m.clean_only,
                                 force: needs_force,
                                 sudo: needs_sudo,
                             }));
@@ -183,10 +200,13 @@ pub fn select(repo: &Repo, entries: &[Entry], args: &Args) -> Result<Option<Sele
                 KeyCode::Up | KeyCode::Char('k') if !entries.is_empty() => cursor.select(Some(
                     (cursor.selected().unwrap_or(0) + entries.len() - 1) % entries.len(),
                 )),
+                KeyCode::Char('c') => {
+                    args.clean_only = !args.clean_only;
+                    selected.clear();
+                }
                 KeyCode::Char(' ') => {
                     if let Some(i) = cursor.selected()
-                        && entries[i].kind != Kind::Main
-                        && !entries[i].locked
+                        && selectable(&entries[i], args.clean_only)
                         && !selected.remove(&i)
                     {
                         selected.insert(i);
@@ -196,7 +216,7 @@ pub fn select(repo: &Repo, entries: &[Entry], args: &Args) -> Result<Option<Sele
                     let available: BTreeSet<_> = entries
                         .iter()
                         .enumerate()
-                        .filter(|(_, e)| e.kind != Kind::Main && !e.locked)
+                        .filter(|(_, e)| selectable(e, args.clean_only))
                         .map(|(i, _)| i)
                         .collect();
                     selected = if selected == available {
@@ -224,6 +244,7 @@ pub fn select(repo: &Repo, entries: &[Entry], args: &Args) -> Result<Option<Sele
 
                     if base_plan.errors.is_empty() {
                         modal = Some(Modal {
+                            clean_only: args.clean_only,
                             kind: ModalKind::ConfirmPlan,
                             reasons: Vec::new(),
                             plan_lines: format_plan_lines(&base_plan),
@@ -245,7 +266,8 @@ pub fn select(repo: &Repo, entries: &[Entry], args: &Args) -> Result<Option<Sele
 
                         if both_plan.errors.is_empty() {
                             let needs_sudo = !force_plan.errors.is_empty();
-                            let needs_force = !sudo_plan.errors.is_empty() || needs_sudo;
+                            let needs_force =
+                                !args.clean_only && (!sudo_plan.errors.is_empty() || needs_sudo);
                             let mut reasons = base_plan.errors;
                             for err in force_plan.errors {
                                 if !reasons.contains(&err) {
@@ -253,6 +275,7 @@ pub fn select(repo: &Repo, entries: &[Entry], args: &Args) -> Result<Option<Sele
                                 }
                             }
                             modal = Some(Modal {
+                                clean_only: args.clean_only,
                                 kind: ModalKind::ConfirmForce {
                                     needs_force,
                                     needs_sudo,
@@ -263,6 +286,7 @@ pub fn select(repo: &Repo, entries: &[Entry], args: &Args) -> Result<Option<Sele
                             });
                         } else {
                             modal = Some(Modal {
+                                clean_only: args.clean_only,
                                 kind: ModalKind::HardBlocked,
                                 reasons: both_plan.errors.clone(),
                                 plan_lines: format_plan_lines(&both_plan),
@@ -278,6 +302,14 @@ pub fn select(repo: &Repo, entries: &[Entry], args: &Args) -> Result<Option<Sele
     })();
     ratatui::restore();
     result
+}
+
+fn selectable(entry: &Entry, clean_only: bool) -> bool {
+    if clean_only {
+        matches!(entry.kind, Kind::Main | Kind::Worktree)
+    } else {
+        entry.kind != Kind::Main && !entry.locked
+    }
 }
 
 fn render_header(
@@ -300,7 +332,11 @@ fn render_header(
 
     let mut badges = vec![
         Span::styled(
-            " worktree-prune ",
+            if args.clean_only {
+                " CLEAN TARGETS — keep worktrees "
+            } else {
+                " worktree-prune "
+            },
             Style::default()
                 .fg(Color::Rgb(16, 20, 28))
                 .bg(Color::Cyan)
@@ -393,6 +429,7 @@ fn render_header(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_worktree_table(
     frame: &mut ratatui::Frame,
     area: Rect,
@@ -401,9 +438,10 @@ fn render_worktree_table(
     target_sizes: &[u64],
     selected: &BTreeSet<usize>,
     cursor: &mut TableState,
+    clean_only: bool,
 ) {
     let rows = entries.iter().enumerate().map(|(i, e)| {
-        let protected = e.kind == Kind::Main || e.locked;
+        let protected = !selectable(e, clean_only);
         let is_selected = selected.contains(&i);
         let marker = if protected {
             Cell::from(Span::styled("[-]", Style::default().fg(Color::DarkGray)))
@@ -553,7 +591,12 @@ fn render_inspector(
     if let Some(i) = current_idx
         && let Some(e) = entries.get(i)
     {
-        let status_note = if e.kind == Kind::Main {
+        let status_note = if args.clean_only {
+            Span::styled(
+                "Clean Cargo target only; keep worktree and branch",
+                Style::default().fg(Color::Cyan),
+            )
+        } else if e.kind == Kind::Main {
             Span::styled(
                 "Main checkout (protected)",
                 Style::default().fg(Color::Cyan),
@@ -677,6 +720,9 @@ fn render_footer(frame: &mut ratatui::Frame, area: Rect) {
         Span::styled(" a ", key_style),
         Span::styled(" toggle all", desc_style),
         sep.clone(),
+        Span::styled(" c ", key_style),
+        Span::styled(" clean/remove mode", desc_style),
+        sep.clone(),
         Span::styled(" Enter ", key_style),
         Span::styled(" preview & confirm", desc_style),
         sep,
@@ -705,6 +751,17 @@ fn format_plan_lines(plan: &Plan) -> Vec<Line<'static>> {
         ]));
     }
     for item in &plan.items {
+        if item.clean_only {
+            lines.push(Line::from(format!(
+                "CLEAN cargo target: {}",
+                item.entry.target.display()
+            )));
+            lines.push(Line::from(format!(
+                "KEEP worktree and branch: {}",
+                item.entry.path.display()
+            )));
+            continue;
+        }
         lines.push(Line::from(vec![
             Span::styled(
                 "REMOVE ",
@@ -778,7 +835,7 @@ fn render_modal(frame: &mut ratatui::Frame, modal: &Modal, selected: usize, scro
     let foreground = Color::Rgb(230, 234, 242);
     let muted = Color::Rgb(154, 165, 184);
 
-    let (accent, title, subtitle) = match modal.kind {
+    let (accent, mut title, subtitle) = match modal.kind {
         ModalKind::ConfirmPlan => (
             Color::Rgb(105, 210, 145),
             "Removal plan — confirm deletion",
@@ -816,6 +873,13 @@ fn render_modal(frame: &mut ratatui::Frame, modal: &Modal, selected: usize, scro
         ),
     };
 
+    if modal.clean_only {
+        title = match modal.kind {
+            ModalKind::ConfirmPlan => "Clean targets — keep worktrees",
+            ModalKind::ConfirmForce { .. } => "Clean targets — confirm SUDO",
+            ModalKind::HardBlocked => "Clean targets — blocked",
+        };
+    }
     frame.buffer_mut().set_style(
         screen,
         Style::default()
@@ -839,7 +903,11 @@ fn render_modal(frame: &mut ratatui::Frame, modal: &Modal, selected: usize, scro
     frame.render_widget(Clear, area);
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .title(" Removal plan ")
+        .title(if modal.clean_only {
+            " Clean targets "
+        } else {
+            " Removal plan "
+        })
         .border_style(Style::default().fg(accent))
         .style(Style::default().bg(background).fg(foreground))
         .padding(Padding::horizontal(if width >= 60 { 2 } else { 1 }));
@@ -951,29 +1019,36 @@ fn render_modal(frame: &mut ratatui::Frame, modal: &Modal, selected: usize, scro
         );
     }
 
-    let (callout_title, warning) = match modal.kind {
-        ModalKind::ConfirmPlan => (
-            "Ready to remove",
-            "Selected worktrees and their unshared Cargo targets will be permanently deleted.",
-        ),
-        ModalKind::ConfirmForce {
-            needs_force: _,
-            needs_sudo: true,
-        } => (
-            "Before you continue (FORCE + SUDO)",
-            "Locked/unwritable or foreign-owned folders will be removed with sudo (password may be requested). Local changes and untracked files will be lost.",
-        ),
-        ModalKind::ConfirmForce {
-            needs_force: _,
-            needs_sudo: false,
-        } => (
-            "Before you continue (FORCE)",
-            "Local changes and untracked files will be lost. Local-only commits remain only in the local branch.",
-        ),
-        ModalKind::HardBlocked => (
-            "This selection is protected",
-            "Force and sudo cannot bypass these protections. Resolve the reasons above, then try again.",
-        ),
+    let (callout_title, warning) = if modal.clean_only {
+        (
+            "Keep worktrees and branches",
+            "Only the listed Cargo build targets will be deleted. Source files, local changes and Git registrations are preserved.",
+        )
+    } else {
+        match modal.kind {
+            ModalKind::ConfirmPlan => (
+                "Ready to remove",
+                "Selected worktrees and their unshared Cargo targets will be permanently deleted.",
+            ),
+            ModalKind::ConfirmForce {
+                needs_force: _,
+                needs_sudo: true,
+            } => (
+                "Before you continue (FORCE + SUDO)",
+                "Locked/unwritable or foreign-owned folders will be removed with sudo (password may be requested). Local changes and untracked files will be lost.",
+            ),
+            ModalKind::ConfirmForce {
+                needs_force: _,
+                needs_sudo: false,
+            } => (
+                "Before you continue (FORCE)",
+                "Local changes and untracked files will be lost. Local-only commits remain only in the local branch.",
+            ),
+            ModalKind::HardBlocked => (
+                "This selection is protected",
+                "Force and sudo cannot bypass these protections. Resolve the reasons above, then try again.",
+            ),
+        }
     };
 
     frame.render_widget(
@@ -999,7 +1074,11 @@ fn render_modal(frame: &mut ratatui::Frame, modal: &Modal, selected: usize, scro
         ModalKind::ConfirmPlan => {
             buttons.push(Span::raw("   "));
             buttons.push(Span::styled(
-                "  y  Confirm removal  ",
+                if modal.clean_only {
+                    "  y  Confirm clean  "
+                } else {
+                    "  y  Confirm removal  "
+                },
                 Style::default()
                     .fg(background)
                     .bg(accent)
@@ -1012,7 +1091,11 @@ fn render_modal(frame: &mut ratatui::Frame, modal: &Modal, selected: usize, scro
         } => {
             buttons.push(Span::raw("   "));
             buttons.push(Span::styled(
-                "  y  Confirm force + sudo  ",
+                if modal.clean_only {
+                    "  y  Clean with sudo  "
+                } else {
+                    "  y  Confirm force + sudo  "
+                },
                 Style::default()
                     .fg(background)
                     .bg(accent)

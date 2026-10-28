@@ -1,5 +1,6 @@
 use crate::Args;
 use anyhow::{Context, Result, bail, ensure};
+use rayon::prelude::*;
 use std::{
     collections::BTreeSet,
     ffi::OsStr,
@@ -19,6 +20,7 @@ pub enum Kind {
 }
 #[derive(Clone, Debug)]
 pub struct Entry {
+    pub repository: PathBuf,
     pub path: PathBuf,
     pub branch: Option<String>,
     pub target: PathBuf,
@@ -44,6 +46,7 @@ pub struct Repo {
 pub struct Item {
     pub entry: Entry,
     pub target: bool,
+    pub clean_only: bool,
 }
 pub struct Plan {
     pub items: Vec<Item>,
@@ -54,6 +57,14 @@ impl Plan {
     pub fn describe(&self) -> String {
         let mut lines = self.notes.clone();
         for item in &self.items {
+            if item.clean_only {
+                lines.push(format!(
+                    "CLEAN cargo target: {}",
+                    item.entry.target.display()
+                ));
+                lines.push(format!("  KEEP worktree: {}", item.entry.path.display()));
+                continue;
+            }
             lines.push(format!(
                 "REMOVE {:?}: {}",
                 item.entry.kind,
@@ -172,6 +183,7 @@ impl Repo {
                     Kind::Worktree
                 };
                 current = Some(Entry {
+                    repository: self.common.clone(),
                     target: self.target(&path)?,
                     path,
                     kind,
@@ -205,7 +217,7 @@ impl Repo {
                 break;
             }
         }
-        absolute(
+        let external = absolute(
             &self
                 .key
                 .join(if wt == self.main {
@@ -214,8 +226,15 @@ impl Repo {
                     wt.file_name().context("worktree has no name")?
                 })
                 .join("target"),
-        )
+        )?;
+        let local = wt.join("target");
+        if !external.exists() && local.is_dir() {
+            absolute(&local)
+        } else {
+            Ok(external)
+        }
     }
+
     pub fn inventory(&self, orphans: bool) -> Result<Vec<Entry>> {
         let mut entries = self.registered()?;
         let mut parents: BTreeSet<PathBuf> = entries
@@ -262,6 +281,7 @@ impl Repo {
                 };
                 if ours {
                     entries.push(Entry {
+                        repository: self.common.clone(),
                         path,
                         target,
                         branch: None,
@@ -286,6 +306,7 @@ impl Repo {
                     continue;
                 }
                 entries.push(Entry {
+                    repository: self.common.clone(),
                     target: path.clone(),
                     path,
                     branch: None,
@@ -351,24 +372,30 @@ impl Repo {
             "{:<25} {:<28} {:<12} {:<7} TARGET",
             "NAME", "BRANCH", "STATE", "DIRTY"
         );
-        for e in entries {
-            let state = self.state(e).unwrap_or_else(|_| "unknown".into());
-            let dirty = if e.kind == Kind::Worktree || e.kind == Kind::Main {
-                self.dirty(e)
-                    .map(|d| if d { "yes" } else { "no" })
-                    .unwrap_or("?")
-            } else {
-                "?"
-            };
-            println!(
-                "{:<25} {:<28} {:<12} {:<7} {}  {}",
-                e.name().escape_default(),
-                e.branch.as_deref().unwrap_or("(detached)"),
-                state,
-                dirty,
-                human(bytes(&e.target)),
-                e.target.display()
-            );
+        let rows: Vec<_> = entries
+            .par_iter()
+            .map(|e| {
+                let state = self.state(e).unwrap_or_else(|_| "unknown".into());
+                let dirty = if e.kind == Kind::Worktree || e.kind == Kind::Main {
+                    self.dirty(e)
+                        .map(|d| if d { "yes" } else { "no" })
+                        .unwrap_or("?")
+                } else {
+                    "?"
+                };
+                format!(
+                    "{:<25} {:<28} {:<12} {:<7} {}  {}",
+                    e.name().escape_default(),
+                    e.branch.as_deref().unwrap_or("(detached)"),
+                    state,
+                    dirty,
+                    human(bytes(&e.target)),
+                    e.target.display()
+                )
+            })
+            .collect();
+        for row in rows {
+            println!("{row}");
         }
     }
     fn target_safe(&self, entry: &Entry, entries: &[Entry]) -> bool {
@@ -385,52 +412,92 @@ impl Repo {
                 .any(|e| e.path != entry.path && (overlaps(td, &e.target) || overlaps(td, &e.path)))
             && (entry.kind == Kind::Orphan || !entry.path.starts_with(td))
     }
+    fn clean_target_safe(&self, entry: &Entry, entries: &[Entry]) -> Result<()> {
+        let td = &entry.target;
+        ensure!(
+            matches!(entry.kind, Kind::Main | Kind::Worktree),
+            "only registered worktrees can be cleaned"
+        );
+        let local = entry.path.join("target");
+        let local_target = td == &local && !local.is_symlink();
+        ensure!(
+            local_target || (td.starts_with(&self.base) && td != &self.base && td != &self.key),
+            "target outside the Cargo target base or protected"
+        );
+        ensure!(
+            !overlaps(td, &self.common)
+                && !self.main.starts_with(td)
+                && !entry.path.starts_with(td),
+            "target overlaps repository files"
+        );
+        ensure!(
+            !entries.iter().any(|other| other.path != entry.path
+                && (overlaps(td, &other.target)
+                    || other.path.starts_with(td)
+                    || (!local_target && td.starts_with(&other.path)))),
+            "target is shared or overlaps another worktree"
+        );
+        if local_target {
+            let tracked = output(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(&entry.path)
+                    .args(["ls-files", "-z", "--", "target"]),
+            )?;
+            ensure!(
+                tracked.stdout.is_empty(),
+                "target contains tracked source files"
+            );
+        }
+        ensure!(
+            !absolute(&std::env::current_dir()?)?.starts_with(td),
+            "target contains the current working directory"
+        );
+        Ok(())
+    }
     pub fn plan(&self, entries: &[Entry], args: &Args) -> Result<Plan> {
         let mut plan = Plan {
             items: vec![],
             errors: vec![],
             notes: vec![],
         };
-        let mut selected = BTreeSet::new();
-        for arg in &args.worktrees {
-            let resolved = absolute(arg)?;
-            let exact: Vec<_> = entries
-                .iter()
-                .enumerate()
-                .filter(|(_, e)| e.path == resolved)
-                .map(|(i, _)| i)
-                .collect();
-            let matches: Vec<_> = if !exact.is_empty() {
-                exact
-            } else {
-                entries
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, e)| {
-                        arg.components().count() == 1 && e.path.file_name() == Some(arg.as_os_str())
-                    })
-                    .map(|(i, _)| i)
-                    .collect()
-            };
-            if matches.len() == 1 {
-                selected.insert(matches[0]);
-            } else {
-                plan.errors
-                    .push(format!("{}: unknown or ambiguous worktree", arg.display()));
-            }
-        }
-        for (i, e) in entries.iter().enumerate() {
-            if (args.stale && e.kind == Kind::Stale) || (args.orphans && e.kind == Kind::Orphan) {
-                selected.insert(i);
-            }
-        }
-        for i in selected {
+        let (selected, errors) = select_entries(entries, args)?;
+        plan.errors.extend(errors);
+        // Indexed collection keeps items and diagnostics in selection order.
+        let selected: Vec<_> = selected.into_iter().collect();
+        let parts: Vec<_> = selected.par_iter().map(|&i| {
+            let mut plan = Plan { items: vec![], errors: vec![], notes: vec![] };
             let e = &entries[i];
+            if args.clean_only {
+                let check = (|| -> Result<()> {
+                    self.clean_target_safe(e, entries)?;
+                    if e.target.exists() {
+                        ensure!(e.target.is_dir(), "target is not a directory");
+                        preflight(&e.target, args.sudo)?;
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = check {
+                    plan.errors
+                        .push(format!("{}: {error:#}", e.target.display()));
+                } else if e.target.is_dir() {
+                    plan.items.push(Item {
+                        entry: e.clone(),
+                        target: true,
+                        clean_only: true,
+                    });
+                } else {
+                    plan.notes
+                        .push(format!("Already clean: {}", e.target.display()));
+                }
+                return plan;
+            }
             let check = (|| -> Result<()> {
                 ensure!(e.kind != Kind::Main, "main checkout is protected");
                 ensure!(!e.locked, "locked worktree; unlock it explicitly first");
                 ensure!(
-                    !self.root.starts_with(&e.path),
+                    !self.root.starts_with(&e.path)
+                        && !absolute(&std::env::current_dir()?)?.starts_with(&e.path),
                     "cannot remove the current working directory or its ancestor; run from the main checkout"
                 );
                 ensure!(
@@ -476,7 +543,7 @@ impl Repo {
             })();
             if let Err(err) = check {
                 plan.errors.push(format!("{}: {err:#}", e.path.display()));
-                continue;
+                return plan;
             }
             let target = !args.keep_target
                 && e.kind != Kind::Orphan
@@ -485,7 +552,7 @@ impl Repo {
             if target {
                 if let Err(err) = preflight(&e.target, args.sudo) {
                     plan.errors.push(format!("{}: {err:#}", e.target.display()));
-                    continue;
+                    return plan;
                 }
             } else if e.kind != Kind::Orphan && e.target.is_dir() {
                 plan.notes.push(format!(
@@ -501,7 +568,14 @@ impl Repo {
             plan.items.push(Item {
                 entry: e.clone(),
                 target,
+                clean_only: false,
             });
+            plan
+        }).collect();
+        for part in parts {
+            plan.items.extend(part.items);
+            plan.errors.extend(part.errors);
+            plan.notes.extend(part.notes);
         }
         Ok(plan)
     }
@@ -607,6 +681,272 @@ impl Repo {
         Ok(())
     }
 }
+
+fn select_entries(entries: &[Entry], args: &Args) -> Result<(BTreeSet<usize>, Vec<String>)> {
+    let mut errors = Vec::new();
+    let mut selected = BTreeSet::new();
+    for arg in &args.worktrees {
+        let resolved = absolute(arg)?;
+        let exact: Vec<_> = entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.path == resolved)
+            .map(|(i, _)| i)
+            .collect();
+        let matches: Vec<_> = if !exact.is_empty() {
+            exact
+        } else {
+            entries
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| {
+                    arg.components().count() == 1 && e.path.file_name() == Some(arg.as_os_str())
+                })
+                .map(|(i, _)| i)
+                .collect()
+        };
+        if matches.len() == 1 {
+            selected.insert(matches[0]);
+        } else {
+            errors.push(format!("{}: unknown or ambiguous worktree", arg.display()));
+        }
+    }
+    for (i, e) in entries.iter().enumerate() {
+        if (args.stale && e.kind == Kind::Stale) || (args.orphans && e.kind == Kind::Orphan) {
+            selected.insert(i);
+        }
+    }
+    Ok((selected, errors))
+}
+
+/// A single inventory and removal plan spanning all discovered repositories.
+pub struct Workspace {
+    repos: Vec<Repo>,
+}
+impl Workspace {
+    pub fn discover(path: &Path) -> Result<Self> {
+        let root = absolute(path)?;
+        ensure!(root.is_dir(), "not a directory: {}", root.display());
+        let mut repos = Vec::new();
+        let mut seen = BTreeSet::new();
+        // Preserve invocation from a subdirectory or a linked worktree.
+        if let Ok(mut repo) = Repo::open(&root) {
+            repo.root = root.clone();
+            seen.insert(repo.common.clone());
+            repos.push(repo);
+        }
+        let mut walk = WalkDir::new(&root)
+            .follow_links(false)
+            .sort_by_file_name()
+            .into_iter();
+        while let Some(entry) = walk.next() {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    eprintln!("worktree-prune: cannot scan: {error}");
+                    continue;
+                }
+            };
+            if !entry.file_type().is_dir() {
+                continue;
+            }
+            if entry.file_name() == ".git" {
+                walk.skip_current_dir();
+                continue;
+            }
+            let path = entry.path();
+            let bare = path.join("HEAD").is_file()
+                && path.join("objects").is_dir()
+                && path.join("refs").is_dir();
+            if path.join(".git").exists() || bare {
+                match Repo::open(path) {
+                    Ok(mut repo) => {
+                        repo.root = root.clone();
+                        if seen.insert(repo.common.clone()) {
+                            repos.push(repo);
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("worktree-prune: skipping {}: {error:#}", path.display())
+                    }
+                }
+                if bare {
+                    walk.skip_current_dir();
+                }
+            }
+        }
+        Ok(Self { repos })
+    }
+    fn owner(&self, entry: &Entry) -> &Repo {
+        self.repos
+            .iter()
+            .find(|r| r.common == entry.repository)
+            .expect("inventory entry belongs to a discovered repository")
+    }
+    pub fn label(&self, entry: &Entry) -> String {
+        if self.repos.len() == 1 {
+            entry.name()
+        } else {
+            format!(
+                "{} / {}",
+                self.owner(entry)
+                    .main
+                    .strip_prefix(&self.owner(entry).root)
+                    .ok()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .unwrap_or(&self.owner(entry).main)
+                    .display(),
+                entry.name()
+            )
+        }
+    }
+    pub fn inventory(&self, orphans: bool) -> Result<Vec<Entry>> {
+        let mut entries = Vec::new();
+        let inventories: Vec<_> = self
+            .repos
+            .par_iter()
+            .map(|repo| repo.inventory(orphans))
+            .collect();
+        // Resolve failures in repository order after every independent inventory completes.
+        for inventory in inventories {
+            entries.extend(inventory?);
+        }
+        let live: Vec<_> = entries
+            .iter()
+            .filter(|e| e.kind != Kind::Orphan)
+            .cloned()
+            .collect();
+        let mut seen = BTreeSet::new();
+        entries.retain(|e| {
+            (e.kind != Kind::Orphan
+                || !live.iter().any(|other| {
+                    overlaps(&e.path, &other.target) || overlaps(&e.path, &other.path)
+                }))
+                && seen.insert(e.path.clone())
+        });
+        Ok(entries)
+    }
+    pub fn state(&self, entry: &Entry) -> Result<String> {
+        self.owner(entry).state(entry)
+    }
+    pub fn dirty(&self, entry: &Entry) -> Result<bool> {
+        self.owner(entry).dirty(entry)
+    }
+    pub fn list(&self, entries: &[Entry], quiet: bool) {
+        if quiet {
+            return;
+        }
+        if self.repos.is_empty() {
+            println!("No Git repositories found.");
+        }
+        for repo in &self.repos {
+            println!("Repository: {}", repo.main.display());
+            let own: Vec<_> = entries
+                .iter()
+                .filter(|e| e.repository == repo.common)
+                .cloned()
+                .collect();
+            repo.list(&own, false);
+        }
+    }
+    pub fn plan(&self, entries: &[Entry], args: &Args) -> Result<Plan> {
+        let mut plan = Plan {
+            items: vec![],
+            errors: vec![],
+            notes: vec![],
+        };
+        let (selected, errors) = select_entries(entries, args)?;
+        plan.errors.extend(errors);
+
+        let parts: Vec<_> = self
+            .repos
+            .par_iter()
+            .map(|repo| {
+                let mut local = args.clone();
+                local.stale = false;
+                local.orphans = false;
+                local.worktrees = selected
+                    .iter()
+                    .map(|&i| &entries[i])
+                    .filter(|e| e.repository == repo.common)
+                    .map(|e| e.path.clone())
+                    .collect();
+                // All entries participate in overlap/shared-target checks across repositories.
+                repo.plan(entries, &local)
+            })
+            .collect();
+        for part in parts {
+            let part = part?;
+            plan.items.extend(part.items);
+            plan.errors.extend(part.errors);
+            plan.notes.extend(part.notes);
+        }
+        Ok(plan)
+    }
+    pub fn execute(&self, plan: &Plan, args: &Args) -> Result<()> {
+        ensure!(
+            plan.errors.is_empty(),
+            "plan blocked; nothing removed\n{}",
+            plan.errors.join("\n")
+        );
+        if args.clean_only {
+            // Re-read all repositories, including sharing and configured paths, before any removal.
+            let fresh = self.inventory(false)?;
+            let checked = self.plan(&fresh, args)?;
+            ensure!(
+                checked.errors.is_empty(),
+                "clean plan blocked; nothing removed\n{}",
+                checked.errors.join("\n")
+            );
+            ensure!(
+                checked
+                    .items
+                    .iter()
+                    .all(|item| plan.items.iter().any(|old| old.clean_only
+                        && old.entry.path == item.entry.path
+                        && old.entry.target == item.entry.target)),
+                "target paths changed after confirmation; review a new plan"
+            );
+            if args.yes {
+                let mut freed = 0;
+                for item in &checked.items {
+                    freed += bytes(&item.entry.target);
+                    remove(&item.entry.target, args.sudo)?;
+                    println!(
+                        "Cleaned {}; kept worktree {}",
+                        item.entry.target.display(),
+                        item.entry.path.display()
+                    );
+                }
+                println!(
+                    "worktree-prune: cleaned {} target(s), freed {}",
+                    checked.items.len(),
+                    human(freed)
+                );
+            }
+            return Ok(());
+        }
+        for repo in &self.repos {
+            let part = Plan {
+                items: plan
+                    .items
+                    .iter()
+                    .filter(|i| i.entry.repository == repo.common)
+                    .map(|i| Item {
+                        entry: i.entry.clone(),
+                        target: i.target,
+                        clean_only: i.clean_only,
+                    })
+                    .collect(),
+                errors: vec![],
+                notes: vec![],
+            };
+            repo.execute(&part, args)?;
+        }
+        Ok(())
+    }
+}
+
 fn preflight(path: &Path, sudo: bool) -> Result<()> {
     // Conservative ownership check before Git can partially remove a checkout.
     let uid = unsafe { libc::geteuid() };

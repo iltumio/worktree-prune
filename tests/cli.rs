@@ -287,3 +287,211 @@ fn sudo_removes_unwritable_worktree_and_target() {
     success(out);
     assert!(!wt.exists() && !td.exists());
 }
+
+fn run_from(f: &Fixture, root: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_worktree-prune"))
+        .current_dir(root)
+        .env("CARGO_TARGET_BASE_DIR", &f.base)
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+fn nested_repo(f: &Fixture) -> PathBuf {
+    let other = f.main.join("nested/deep/other");
+    fs::create_dir_all(other.parent().unwrap()).unwrap();
+    git(
+        &f.main,
+        &["clone", f.main.to_str().unwrap(), other.to_str().unwrap()],
+    );
+    other
+}
+
+#[test]
+fn recursive_discovery_deduplicates_and_lists_external_worktrees() {
+    let f = Fixture::new();
+    f.wt("first");
+    let other = nested_repo(&f);
+    let external = tempfile::tempdir().unwrap();
+    let wt = external.path().join("external-feature");
+    git(
+        &other,
+        &["worktree", "add", "-b", "second", wt.to_str().unwrap()],
+    );
+    std::os::unix::fs::symlink(f._temp.path(), f.main.join("loop")).unwrap();
+    for out in [
+        run_from(&f, f._temp.path(), &["--list"]),
+        f.run(&["-C", f._temp.path().to_str().unwrap(), "--list"]),
+    ] {
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(text.matches("Repository:").count(), 2, "{text}");
+        assert_eq!(text.matches("external-feature").count(), 2, "{text}");
+        assert!(text.contains("first") && text.contains("second"), "{text}");
+        success(out);
+    }
+}
+
+#[test]
+fn recursive_batch_rejects_ambiguity_and_blocks_all_repos_before_removal() {
+    let f = Fixture::new();
+    let first = f.wt("same");
+    let other = nested_repo(&f);
+    let second = other.join(".worktrees/same");
+    git(
+        &other,
+        &["worktree", "add", "-b", "second", second.to_str().unwrap()],
+    );
+    let out = f.run(&["same", "--yes"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("ambiguous"));
+    fs::write(second.join("precious"), "keep").unwrap();
+    let args = [first.to_str().unwrap(), second.to_str().unwrap(), "--yes"];
+    assert!(!f.run(&args).status.success());
+    assert!(first.exists() && second.exists());
+    fs::remove_file(second.join("precious")).unwrap();
+    success(f.run(&args));
+    assert!(!first.exists() && !second.exists());
+}
+
+#[test]
+fn recursive_batch_preserves_targets_shared_across_repositories() {
+    let f = Fixture::new();
+    let first = f.wt("first");
+    let other = nested_repo(&f);
+    let second = other.join(".worktrees/second");
+    git(
+        &other,
+        &["worktree", "add", "-b", "second", second.to_str().unwrap()],
+    );
+    let target = f.target("shared");
+    for path in [&first, &second] {
+        fs::create_dir(path.join(".cargo")).unwrap();
+        fs::write(
+            path.join(".cargo/config.toml"),
+            format!("[build]\ntarget-dir = '{}'", target.display()),
+        )
+        .unwrap();
+    }
+    success(f.run(&["first", "second", "--yes", "--force"]));
+    assert!(!first.exists() && !second.exists() && target.exists());
+}
+
+#[test]
+fn discovery_handles_empty_directories_and_bare_repositories() {
+    let f = Fixture::new();
+    let empty = tempfile::tempdir().unwrap();
+    let out = run_from(&f, empty.path(), &["--list"]);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("No Git repositories"));
+    success(out);
+    let bare = empty.path().join("bare.git");
+    git(
+        &f.main,
+        &[
+            "clone",
+            "--bare",
+            f.main.to_str().unwrap(),
+            bare.to_str().unwrap(),
+        ],
+    );
+    let wt = empty.path().join("linked");
+    git(
+        &bare,
+        &["worktree", "add", "-b", "linked", wt.to_str().unwrap()],
+    );
+    let out = run_from(&f, empty.path(), &["--list"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(text.matches("Repository:").count(), 1, "{text}");
+    assert!(text.contains("linked"));
+    success(out);
+}
+
+#[test]
+fn parallel_checks_preserve_order_and_block_the_entire_batch() {
+    let f = Fixture::new();
+    let clean = f.wt("clean");
+    let dirty = f.wt("dirty");
+    let locked = f.wt("locked");
+    fs::write(dirty.join("precious"), "keep").unwrap();
+    git(&f.main, &["worktree", "lock", locked.to_str().unwrap()]);
+    let other = nested_repo(&f);
+    let second = other.join(".worktrees/second");
+    git(
+        &other,
+        &["worktree", "add", "-b", "second", second.to_str().unwrap()],
+    );
+    for args in [
+        vec!["--list"],
+        vec!["clean", "second"],
+        vec!["clean", "dirty", "locked", "second", "--yes"],
+    ] {
+        let run = |threads: &str| {
+            Command::new(env!("CARGO_BIN_EXE_worktree-prune"))
+                .current_dir(&f.main)
+                .env("CARGO_TARGET_BASE_DIR", &f.base)
+                .env("WTP_THREADS", threads)
+                .args(&args)
+                .output()
+                .unwrap()
+        };
+        let serial = run("1");
+        let parallel = run("4");
+        assert_eq!(serial.status.code(), parallel.status.code());
+        assert_eq!(serial.stdout, parallel.stdout);
+        assert_eq!(serial.stderr, parallel.stderr);
+        if args.contains(&"--yes") {
+            assert!(!parallel.status.success());
+            let stderr = String::from_utf8_lossy(&parallel.stderr);
+            assert!(stderr.contains("uncommitted") && stderr.contains("locked worktree"));
+        } else {
+            success(parallel);
+        }
+        assert!(clean.exists() && dirty.exists() && locked.exists() && second.exists());
+    }
+}
+
+#[test]
+fn startup_loads_xdg_config_and_rejects_invalid_config_before_removal() {
+    let f = Fixture::new();
+    let wt = f.wt("feature");
+    let config_root = f._temp.path().join("config");
+    fs::create_dir_all(config_root.join("worktree-prune")).unwrap();
+    let config = config_root.join("worktree-prune/config.toml");
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_worktree-prune"))
+            .current_dir(&f.main)
+            .env("CARGO_TARGET_BASE_DIR", &f.base)
+            .env("XDG_CONFIG_HOME", &config_root)
+            .env_remove("WTP_THREADS")
+            .env("RAYON_NUM_THREADS", "invalid-ignored")
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    fs::write(&config, "threads = 2").unwrap();
+    success(run(&["--list"]));
+    fs::write(&config, "threads = 0").unwrap();
+    let out = run(&["feature", "--yes"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("config.toml"));
+    assert!(wt.exists());
+    success(run(&["--help"]));
+    success(run(&["--version"]));
+
+    let home = f._temp.path().join("home");
+    fs::create_dir_all(home.join(".config/worktree-prune")).unwrap();
+    fs::write(
+        home.join(".config/worktree-prune/config.toml"),
+        "threads = 0",
+    )
+    .unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_worktree-prune"))
+        .current_dir(&f.main)
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", "relative-is-ignored")
+        .env_remove("WTP_THREADS")
+        .arg("--list")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains(".config/worktree-prune/config.toml"));
+}

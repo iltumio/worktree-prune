@@ -1,0 +1,5 @@
+# Copy to ~/.config/worktree-prune/config.toml
+# or $XDG_CONFIG_HOME/worktree-prune/config.toml.
+# Omit threads to use the system's available parallelism.
+# Override with: WTP_THREADS=8 worktree-prune
+threads = 4

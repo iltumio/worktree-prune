@@ -26,19 +26,26 @@ La directory scelta deve essere nel `PATH`; lo script segnala se manca, senza mo
 
 ## Uso
 
-Esegui dal checkout principale del repository interessato, oppure usa `-C /percorso/repo`.
+Esegui da qualsiasi cartella: per impostazione predefinita cerca ricorsivamente le repository Git nella cartella corrente e nelle sue sottocartelle, poi mostra tutte le loro worktree in un unico inventario. Usa `-C /percorso/cartella` per scegliere un’altra radice di ricerca. Le worktree registrate vengono incluse anche se si trovano fuori dalla cartella scandita; una stessa repository viene mostrata una sola volta.
+
+La scansione include cartelle nascoste e repository annidate, riconosce repository bare e file `.git`, non segue symlink verso sottocartelle e non entra nei metadati `.git`. Le cartelle non leggibili vengono segnalate e saltate.
 
 ```sh
 worktree-prune                         # apre la TUI
 worktree-prune feature                 # anteprima, nessuna cancellazione
 worktree-prune feature --yes           # elimina worktree e target non condiviso
-worktree-prune --list                  # elenco testuale e dimensioni
+worktree-prune --list                  # tutte le repository sotto la cartella corrente
+worktree-prune -C ~/dev --list         # cerca ricorsivamente in ~/dev
 worktree-prune feature --yes --delete-branch
 worktree-prune --stale --force         # anteprima dei residui non registrati
 worktree-prune --orphans --yes         # elimina target senza proprietario
 ```
 
-Nella TUI: frecce o `j`/`k` per spostarsi, **Spazio** per selezionare, `a` per selezionare/deselezionare tutti, **Invio** per aprire la modale con il piano di rimozione. Nella modale, `y` conferma direttamente la cancellazione (conferma unica); `n` o **Esc** annullano e tornano alla selezione; `q` o **Ctrl+C** escono. Il checkout principale e i worktree bloccati con `git worktree lock` non sono selezionabili. Sono visibili branch, stato dei commit, modifiche locali, dimensioni, barra dello spazio recuperabile e dettagli dell'elemento selezionato. Se la selezione presenta modifiche locali, commit non pubblicati o cartelle bloccate da permessi/proprietario, la modale mostra i motivi del blocco insieme al piano forzato (abilitando `force` e, se necessario per cartelle bloccate, `sudo` previa conferma con `y`). Se il blocco non è superabile, la modale lo segnala e non consente la conferma.
+Nella TUI: frecce o `j`/`k` per spostarsi, **Spazio** per selezionare, `a` per selezionare/deselezionare tutti, **Invio** per aprire la modale con il piano di rimozione. Nella modale, `y` conferma direttamente la cancellazione (conferma unica); `n` o **Esc** annullano e tornano alla selezione; `q` o **Ctrl+C** escono. In modalità rimozione, il checkout principale e i worktree bloccati con `git worktree lock` non sono selezionabili. Sono visibili branch, stato dei commit, modifiche locali, dimensioni, barra dello spazio recuperabile e dettagli dell'elemento selezionato. Se la selezione presenta modifiche locali, commit non pubblicati o cartelle bloccate da permessi/proprietario, la modale mostra i motivi del blocco insieme al piano forzato (abilitando `force` e, se necessario per cartelle bloccate, `sudo` previa conferma con `y`). Se il blocco non è superabile, la modale lo segnala e non consente la conferma.
+
+Per liberare solo lo spazio di build, premi **`c`**: la barra superiore mostra **CLEAN TARGETS — keep worktrees**. Seleziona con **Spazio** (o `a`), premi **Invio** per vedere i percorsi e **`y`** per pulirli. Worktree, branch, modifiche locali e registrazioni Git restano intatti. Funziona anche sul checkout principale, sul worktree corrente e sui worktree bloccati o con commit locali; non serve `--force`. I target condivisi o non sicuri bloccano l’intero piano. I permessi possono richiedere una conferma SUDO. Premi di nuovo `c` per tornare alla rimozione; il cambio modalità azzera la selezione.
+
+La pulizia elimina soltanto il **target mostrato nell’inventario**, senza eseguire `cargo clean`: usa la configurazione locale o il target esterno convenzionale; se quest’ultimo manca e c’è una directory `target/` nel worktree, usa quella. Un `target/` locale con file tracciati da Git viene protetto. Non vengono cercati altri percorsi tramite configurazioni Cargo globali o variabili d’ambiente.
 
 Tutte le opzioni dello script sono disponibili: `-n/--dry-run`, `-y/--yes`, `-f/--force`, `-s/--sudo`, `-q/--quiet`, `--keep-target`, `--delete-branch`, `--list`, `--stale`, `--orphans`. In aggiunta: `-C/--repo`, `--version`. Il comando senza argomenti apre la TUI; qualsiasi argomento o flag usa la CLI senza TUI. `--tui` non è necessario e non è accettato. Senza terminale, il comando senza argomenti suggerisce `--list`. Tra `--yes` e `--dry-run` prevale l'ultima opzione. `--keep-target` e `--orphans` sono incompatibili.
 
@@ -50,7 +57,7 @@ Tutte le opzioni dello script sono disponibili: `-n/--dry-run`, `-y/--yes`, `-f/
 - I residui non registrati richiedono sempre `--force`: anche senza `.git` possono contenere file non salvati altrove. I cloni indipendenti non sono candidati.
 - Checkout principale, worktree bloccati, directory di lavoro corrente e antenati restano protetti anche con `--force`. Per eliminare il worktree in cui ti trovi, spostati prima nel checkout principale.
 - Un errore nei controlli blocca **l'intero piano**. Gli errori durante l'esecuzione interrompono le operazioni successive; le cancellazioni già completate non possono essere annullate. Dopo la conferma TUI inventario e controlli vengono riletti.
-- I target condivisi, sovrapposti ad altri worktree, fuori dalla base o appartenenti al checkout principale vengono conservati. I percorsi sono risolti anche attraverso symlink e `..`. Il target `main` non viene raccolto come orfano.
+- Durante la rimozione dei worktree, i target condivisi, sovrapposti ad altri worktree, fuori dalla base o appartenenti al checkout principale vengono conservati. I percorsi sono risolti anche attraverso symlink e `..`. Il target `main` non viene raccolto come orfano.
 - La base è `CARGO_TARGET_BASE_DIR`, oppure `/.cargo-targets/targets`. La chiave resta `<repo>/<nome-worktree>/target`, con `main` per il checkout principale, compatibile con `cargo-target-provision`. `[build].target-dir` viene letto come TOML; `.cargo/config` ha precedenza su `.cargo/config.toml`. Le configurazioni Cargo globali, ereditate o le variabili `CARGO_TARGET_DIR` non vengono usate per scoprire ulteriori target da cancellare.
 - Proprietà e permessi vengono controllati prima della rimozione. `--sudo` (o la conferma `FORCE + SUDO` nella TUI) abilita `sudo rm` solo quando necessario. Non vengono rimossi worktree ancora registrati se Git rifiuta la rimozione. Non viene eseguito un `git worktree prune` globale su registrazioni estranee al piano.
 - `--quiet` mantiene il comportamento per hook: output sintetico e stato 0 anche in caso di errore operativo. Gli errori di sintassi degli argomenti restano errori.
@@ -78,3 +85,17 @@ Implementazione: `src/main.rs` gestisce gli argomenti, `src/prune.rs` inventario
 GitHub Actions esegue formattazione, Clippy, test CLI e TUI e build release Linux x86_64 su push e pull request, oppure manualmente. Il binario, README e licenza sono disponibili come archivio negli artifact del workflow.
 
 Distribuito con [licenza MIT](LICENSE).
+
+I controlli indipendenti (inventario delle repository, stato Git, dimensioni dei target e verifiche del piano) vengono eseguiti in parallelo con Rayon. Ordine delle righe e diagnostica restano stabili; le cancellazioni sono sequenziali e iniziano solo dopo tutti i controlli. Per limitare il parallelismo, usa ad esempio `WTP_THREADS=4 worktree-prune`.
+
+
+## Configurazione
+
+All’avvio viene letto il file utente `$XDG_CONFIG_HOME/worktree-prune/config.toml`, oppure `~/.config/worktree-prune/config.toml` quando `XDG_CONFIG_HOME` è assente, vuoto o relativo (convenzioni XDG). Il file è opzionale; non viene creato automaticamente.
+
+```toml
+# Numero di thread per i controlli paralleli (intero maggiore di zero).
+threads = 4
+```
+
+Precedenza: `WTP_THREADS` → `threads` nel TOML → parallelismo disponibile del sistema. `RAYON_NUM_THREADS` non viene più usata. Un file malformato, una chiave sconosciuta o un numero di thread non valido vengono segnalati prima della scansione; `--help` e `--version` restano disponibili. Esempio pronto da copiare in `config.example.toml`.
